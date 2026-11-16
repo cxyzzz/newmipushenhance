@@ -1,30 +1,43 @@
-name: Android Build
+name: Android Release
 
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (empty = use versionName from app/build.gradle, e.g. v2.4)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    name: Build debug APK
+    name: Build release APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # sdkmanager (最新 cmdline-tools) 需要 JDK 17
+      # sdkmanager (latest cmdline-tools) requires JDK 17
       - name: Set up JDK 17 for Android SDK tools
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 不使用 android-actions/setup-android@v3（在 Node 24 runner 上会失败），
-      # 直接用 runner 预装的 Android SDK；找不到 sdkmanager 时自行下载 cmdline-tools。
+      # Avoid android-actions/setup-android@v3 (it breaks on the Node 24 runner).
+      # Use the runner-provided Android SDK; download cmdline-tools only if sdkmanager is absent.
       - name: Install Android SDK packages
         run: |
           set -euo pipefail
@@ -46,9 +59,30 @@ jobs:
           yes | "$SM" --sdk_root="$ROOT" --licenses >/dev/null 2>&1 || true
           echo "ANDROID_SDK_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$ROOT" >> "$GITHUB_ENV"
-          ls "$ROOT/platforms" "$ROOT/build-tools"
 
-      # AGP 4.2.2 + Gradle 6.7.1 只支持 JDK 8/11，构建前必须切回 11
+      # Sign with secrets when configured, otherwise release falls back to the debug keystore
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            {
+              echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS=$KEY_ALIAS"
+              echo "KEY_PASSWORD=$KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+            echo "using keystore from secrets"
+          else
+            echo "::warning::KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD not set, release will use the debug keystore"
+          fi
+
+      # AGP 4.2.2 + Gradle 6.7.1 support JDK 8/11 only, switch back before building
       - name: Set up JDK 11 for Gradle
         uses: actions/setup-java@v4
         with:
@@ -56,15 +90,63 @@ jobs:
           java-version: "11"
           cache: gradle
 
-      - name: Build debug APK
+      - name: Build release APK
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
-      - name: Upload debug APK
-        if: always()
+      - name: Collect APK and resolve release tag
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^[[:space:]]*versionName[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p' app/build.gradle | head -n1)"
+          [ -n "${VERSION:-}" ] || VERSION="0.0"
+          APK_SRC="$(ls app/build/outputs/apk/release/*.apk | head -n1)"
+          mkdir -p dist
+          APK="dist/NewMiPushEnhance-v${VERSION}.apk"
+          cp "$APK_SRC" "$APK"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${VERSION}"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "APK=$APK TAG=$TAG"
+          sha256sum "$APK" | tee "$APK.sha256"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: warn
+          name: app-release
+          path: |
+            dist/*.apk
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          APK="${{ steps.meta.outputs.apk }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" "$APK.sha256" --clobber
+          else
+            gh release create "$TAG" "$APK" "$APK.sha256" \
+              --title "v${VERSION}" \
+              --target "$GITHUB_SHA" \
+              --notes "Automated release ${TAG}
+
+          - App version: v${VERSION}
+          - Build commit: $GITHUB_SHA"
+          fi
+          gh release view "$TAG" --json tagName,url,name
