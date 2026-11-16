@@ -2,21 +2,42 @@ plugins {
     id 'com.android.application'
 }
 
+// 优先读环境变量，其次读 gradle 属性（-PKEYSTORE_PATH=...）
+def envOrProp = { String name ->
+    def v = System.getenv(name)
+    return (v != null && !v.trim().isEmpty()) ? v : project.findProperty(name)
+}
+
 android {
     compileSdkVersion 30
     buildToolsVersion '30.0.3'
 
     defaultConfig {
         applicationId 'io.github.codecodegogogo.newmipushenhance'
-        minSdkVersion 16
+        minMinDkVersion 16
         targetSdkVersion 31
         versionCode 6
         versionName "2.4"
         vectorDrawables.useSupportLibrary = true
     }
 
+    signingConfigs {
+        release {
+            def ksPath = envOrProp('KEYSTORE_PATH')
+            if (ksPath != null && file(ksPath).exists()) {
+                storeFile file(ksPath)
+                storePassword envOrProp('KEYSTORE_PASSWORD')
+                keyAlias envOrProp('KEY_ALIAS')
+                keyPassword envOrProp('KEY_PASSWORD')
+            }
+        }
+    }
+
     buildTypes {
         release {
+            minifyEnabled false
+            // 配了对式签名密钥就用对式签名，没有则用 debug 签名，保证每次构建产物可保证每次构建产物可安装。
+            signingConfig signingConfigs.release.storeFile != null ? signingConfigs.release : signingConfigs.debug
         }
     }
     compileOptions {
