@@ -2,9 +2,7 @@ name: Android Build
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
@@ -12,38 +10,61 @@ jobs:
   build:
     name: Build debug APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK for Android SDK
+      # sdkmanager (最新 cmdline-tools) 需要 JDK 17
+      - name: Set up JDK 17 for Android SDK tools
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # 不使用 android-actions/setup-android@v3（在 Node 24 runner 上会失败），
+      # 直接用 runner 预装的 Android SDK；找不到 sdkmanager 时自行下载 cmdline-tools。
       - name: Install Android SDK packages
-        run: sdkmanager "platforms;android-30" "build-tools;30.0.3"
+        run: |
+          set -euo pipefail
+          ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          mkdir -p "$ROOT"
+          SM="$(find "$ROOT" -type f -name sdkmanager 2>/dev/null | head -n1 || true)"
+          if [ -z "$SM" ]; then
+            echo "sdkmanager not found, downloading commandlinetools..."
+            curl -fsSL -o /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            rm -rf "$ROOT/cmdline-tools"
+            mkdir -p "$ROOT/cmdline-tools"
+            unzip -q /tmp/clt.zip -d "$ROOT/cmdline-tools"
+            mv "$ROOT/cmdline-tools/cmdline-tools" "$ROOT/cmdline-tools/latest"
+            SM="$ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "sdkmanager=$SM"
+          yes | "$SM" --sdk_root="$ROOT" --licenses >/dev/null 2>&1 || true
+          "$SM" --sdk_root="$ROOT" "platform-tools" "platforms;android-30" "build-tools;30.0.3"
+          yes | "$SM" --sdk_root="$ROOT" --licenses >/dev/null 2>&1 || true
+          echo "ANDROID_SDK_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ROOT" >> "$GITHUB_ENV"
+          ls "$ROOT/platforms" "$ROOT/build-tools"
 
-      - name: Set up JDK for Gradle
+      # AGP 4.2.2 + Gradle 6.7.1 只支持 JDK 8/11，构建前必须切回 11
+      - name: Set up JDK 11 for Gradle
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "11"
           cache: gradle
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
-
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
       - name: Upload debug APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
